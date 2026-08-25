@@ -1,170 +1,155 @@
-# Assignment: Dockerizing a Node.js + MySQL Application
+# Dockerizing a Node.js + MySQL Application
 
-## What you were given
+A **Task Manager API** (Node.js/Express + MySQL) containerized with Docker and
+Docker Compose.
 
-You were given a working **Node.js / Express** application (`Task Manager API`)
-that needs a **MySQL database** to function. The application code is already
-complete — you do **not** need to modify `server.js`, `db.js`, or
-`package.json`.
+## Stack
 
-Files provided:
+- **app** — Node 20 (alpine), runs the Express API (`server.js`)
+- **mysql** — MySQL 8.0, with the `tasks` table auto-created from `db/init.sql`
+- Both services sit on a custom bridge network (`app-network`) and reach each
+  other by service name (`DB_HOST=mysql`) — no hardcoded IPs or `localhost`
+- MySQL data persists in a named volume (`mysql-data`)
+- `app` waits for MySQL to be truly ready via a healthcheck (`depends_on:
+  condition: service_healthy`), not just started
+
+## Project structure
+
 ```
 student-project/
-├── server.js         # Express app (routes: /, /health, /tasks)
-├── db.js             # MySQL connection pool (reads config from env vars)
-├── package.json       # Node dependencies
-├── db/init.sql         # SQL that creates the "tasks" table
-├── .env.example         # Example environment variables
-└── README.md            # This file
+├── server.js            # Express app (routes: /, /health, /tasks)
+├── db.js                # MySQL connection pool
+├── package.json
+├── db/init.sql           # creates the "tasks" table
+├── .env                   # working environment values
+├── .env.example            # template for the above
+├── Dockerfile               # builds the Node app image
+└── docker-compose.yml        # app + mysql services
 ```
 
-The app exposes these endpoints:
-| Method | Route     | Description                              |
-|--------|-----------|-------------------------------------------|
-| GET    | `/`       | Basic info                                |
-| GET    | `/health` | Returns 200 if the app can reach MySQL    |
-| GET    | `/tasks`  | Lists all tasks from the DB               |
-| POST   | `/tasks`  | Creates a task (`{ "title": "..." }`)     |
+## How the Dockerfile works
 
-Your job is to **containerize this application** and **connect it to a
-MySQL database container**, entirely using Docker and Docker Compose.
+```dockerfile
+FROM node:20-alpine          # small, official Node 20 base image
+WORKDIR /app                 # everything below runs from /app in the container
 
----
+COPY package.json package-lock.json* ./
+RUN npm install --production # deps installed BEFORE the rest of the source is
+                              # copied, so this layer is cached and only
+                              # re-runs when package.json actually changes
 
-## What YOU need to build and deliver
+COPY . .                     # now copy the rest of the app source
 
-You must submit the following, added to this project folder:
+EXPOSE 3000                  # documents the port the app listens on
+CMD ["node", "server.js"]    # matches the "start" script in package.json
+```
 
-### 1. `Dockerfile` (for the Node.js application)
+## How docker-compose.yml works
 
-Write a `Dockerfile` that:
-- Uses an official Node.js base image (choose an appropriate version/tag,
-  and think about why an "alpine" image might be preferred).
-- Sets a working directory inside the container.
-- Copies `package.json` (and `package-lock.json` if present) **first**, and
-  installs dependencies **before** copying the rest of the source code.
-  (Think about *why* this order matters for build caching.)
-- Copies the rest of the application source code into the image.
-- Exposes the port the app listens on (see `PORT` in `.env.example`).
-- Defines the correct `CMD` to start the app (check `package.json` for the
-  start script).
+```yaml
+services:
+  app:
+    build: .                       # build the image from the Dockerfile above
+    env_file: .env                 # inject PORT / DB_* vars into the container
+    ports:
+      - "3000:3000"                # host:container port mapping
+    depends_on:
+      mysql:
+        condition: service_healthy # wait for MySQL to be ready, not just started
+    networks:
+      - app-network
 
-### 2. `docker-compose.yml`
+  mysql:
+    image: mysql:8.0                       # pinned version, not "latest"
+    environment:                            # root password / db / user, matched
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}   # to the app's DB_* values
+      MYSQL_DATABASE: ${MYSQL_DATABASE}             # in .env
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    volumes:
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql  # auto-creates the
+                                                              # "tasks" table
+                                                              # on first boot
+      - mysql-data:/var/lib/mysql            # named volume — data survives
+                                              # container removal
+    healthcheck:                             # lets "app" know when MySQL can
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 5s                           # actually accept connections
+      timeout: 5s
+      retries: 10
+    networks:
+      - app-network
 
-Write a `docker-compose.yml` file that defines **two services**:
+networks:
+  app-network:      # custom bridge network — lets "app" reach MySQL by the
+    driver: bridge   # service name "mysql" instead of an IP or localhost
 
-**Service 1: `app`**
-- Builds from the `Dockerfile` you wrote (use `build: .`).
-- Passes the required environment variables into the container so it can
-  connect to MySQL (`DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`,
-  `DB_NAME`) — you can use `env_file: .env` or an `environment:` block.
-- Maps the container's port to a port on your host machine.
-- Declares a dependency on the `mysql` service so it starts after the
-  database service (research the `depends_on` key, and optionally look
-  into healthchecks so `app` waits until MySQL is actually *ready*, not
-  just *started*).
+volumes:
+  mysql-data:        # declares the named volume used above
+```
 
-**Service 2: `mysql`**
-- Uses an official `mysql` image (pick a specific version tag — avoid
-  `latest` in real projects).
-- Sets the required MySQL environment variables (root password, database
-  name, user, and user password) — match these to the values your `app`
-  service uses to connect.
-- Mounts the `db/init.sql` file into the correct special directory inside
-  the MySQL container so the `tasks` table is created automatically the
-  first time the container starts (research the official `mysql` Docker
-  Hub image documentation for the exact directory name).
-- Mounts a **named Docker volume** to the MySQL data directory
-  (`/var/lib/mysql`) so your data **persists** even if the container is
-  removed and recreated.
+## Instructions — running it step by step
 
-**Both services** must be attached to a **custom Docker network** that you
-define in the `docker-compose.yml` (do not rely on the default network —
-explicitly declare a `networks:` section and attach both services to it).
-This is what allows the `app` container to reach the `mysql` container
-using the service name as a hostname (see `DB_HOST` in `.env.example`).
+1. **Clone the repo and enter the project folder**
+   ```bash
+   git clone https://github.com/ZiadDorrah/Assignment-Dockerizing-a-Node.js-MySQL-Application.git
+   cd Assignment-Dockerizing-a-Node.js-MySQL-Application/student-project
+   ```
+2. **(Optional) Create your own `.env`** — a working one is already committed, but if starting fresh:
+   ```bash
+   cp .env.example .env
+   ```
+3. **Build and start both containers**
+   ```bash
+   docker compose up --build
+   ```
+   This builds the `app` image, pulls `mysql:8.0`, starts MySQL first, waits
+   for its healthcheck to pass, then starts `app`.
+4. **Confirm both containers are healthy**
+   ```bash
+   docker compose ps
+   ```
+5. **Test the API** (see [Testing the endpoints](#testing-the-endpoints) below).
+6. **Stop the containers when done**
+   ```bash
+   docker compose down        # keeps the mysql-data volume
+   # or
+   docker compose down -v     # also deletes the volume (fresh DB next time)
+   ```
 
-You must also declare the **named volume** in a top-level `volumes:`
-section of the compose file.
-
-### 3. `.env` file
-
-- Copy `.env.example` to `.env` and fill in real values.
-- Your `docker-compose.yml` should read from this file.
-- Do **not** commit real secrets if this were a real project — but for
-  this assignment, submit your working `.env` so we can test it.
-
----
-
-## Requirements checklist (what will be graded)
-
-- [ ] `Dockerfile` builds the Node app into a working image
-- [ ] Image uses dependency caching correctly (package.json copied/installed before rest of code)
-- [ ] `docker-compose.yml` defines an `app` service and a `mysql` service
-- [ ] A **custom network** is declared and both services are attached to it
-- [ ] `app` connects to MySQL using the **service name** as the host (not `localhost`, not a hardcoded IP)
-- [ ] A **named volume** is declared and mounted to MySQL's data directory
-- [ ] `db/init.sql` is mounted so the `tasks` table is created automatically on first run
-- [ ] Running `docker compose up --build` starts both containers successfully
-- [ ] `GET http://localhost:<your-port>/health` returns `{"status":"ok","db":"connected"}`
-- [ ] `POST http://localhost:<your-port>/tasks` with a JSON body creates a row
-- [ ] `GET http://localhost:<your-port>/tasks` returns the created row(s)
-- [ ] Stopping and restarting the containers (`docker compose down` then
-      `docker compose up`, **without** `-v`) shows that previously created
-      tasks are still there — proving the volume works
-- [ ] Running `docker compose down -v` and starting again gives you a
-      fresh, empty database — proving you understand what the volume flag does
-
----
-
-## How to test your work
-
-Once your `Dockerfile` and `docker-compose.yml` are in place:
+## Testing the endpoints
 
 ```bash
-# Build and start everything
-docker compose up --build
-
-# In another terminal, test the endpoints
-curl http://localhost:<your-port>/health
-curl http://localhost:<your-port>/tasks
-curl -X POST http://localhost:<your-port>/tasks \
+curl http://localhost:3000/health
+curl http://localhost:3000/tasks
+curl -X POST http://localhost:3000/tasks \
   -H "Content-Type: application/json" \
   -d '{"title": "Finish Docker assignment"}'
-curl http://localhost:<your-port>/tasks
+curl http://localhost:3000/tasks
 ```
 
-Then test persistence:
+## Persistence
+
 ```bash
-docker compose down          # stop containers, keep volume
-docker compose up            # start again
-curl http://localhost:<your-port>/tasks   # data should still be there
+# keeps the mysql-data volume — tasks survive the restart
+docker compose down
+docker compose up
+
+# removes the volume — fresh, empty database
+docker compose down -v
+docker compose up
 ```
 
-And test volume reset:
-```bash
-docker compose down -v       # stop containers AND remove volume
-docker compose up            # start again
-curl http://localhost:<your-port>/tasks   # should be empty now
-```
+## What was built
 
----
-
-## What to submit
-
-Your final project folder, including everything provided **plus** the
-files you created:
-
-```
-student-project/
-├── server.js          (provided)
-├── db.js               (provided)
-├── package.json         (provided)
-├── db/init.sql            (provided)
-├── .env                    (you create, from .env.example)
-├── Dockerfile               (YOU MUST CREATE)
-└── docker-compose.yml         (YOU MUST CREATE)
-```
-
-Good luck — and remember: `DB_HOST` is never `localhost` when your app and
-your database are running in separate containers.
+- [x] `Dockerfile` builds the Node app into a working image (`node:20-alpine`)
+- [x] Dependencies cached correctly (`package.json` copied/installed before the rest of the source)
+- [x] `docker-compose.yml` defines an `app` service and a `mysql` service
+- [x] Custom network (`app-network`) declared, both services attached to it
+- [x] `app` connects to MySQL using the **service name** as the host
+- [x] Named volume (`mysql-data`) mounted to MySQL's data directory
+- [x] `db/init.sql` mounted so the `tasks` table is created automatically on first run
+- [x] `docker compose up --build` starts both containers successfully
+- [x] `/health` returns `{"status":"ok","db":"connected"}`
+- [x] `POST /tasks` creates a row, `GET /tasks` lists it
+- [x] Restarting without `-v` preserves data; `docker compose down -v` resets it
